@@ -19,110 +19,118 @@ const todos: Todo[] = [];
 
 const nowIso = () => new Date().toISOString();
 
-const server = new McpServer({
-  name: "todo-server",
-  version: "1.0.0",
-});
+const createServer = () => {
+  const server = new McpServer({
+    name: "todo-server",
+    version: "1.0.0",
+  });
 
-server.tool(
-  "add_todo",
-  "Add a todo item",
-  {
-    text: z.string().min(1),
-    completed: z.boolean().optional(),
-  },
-  async ({ text, completed }) => {
-    const timestamp = nowIso();
-    const todo: Todo = {
-      id: randomUUID(),
-      text,
-      completed: completed ?? false,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
+  server.tool(
+    "add_todo",
+    "Add a todo item",
+    {
+      text: z.string().min(1),
+      completed: z.boolean().optional(),
+    },
+    async ({ text, completed }) => {
+      const timestamp = nowIso();
+      const todo: Todo = {
+        id: randomUUID(),
+        text,
+        completed: completed ?? false,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
 
-    todos.push(todo);
+      todos.push(todo);
 
-    return {
-      content: [{ type: "text", text: `Added todo: ${todo.text}` }],
-      structuredContent: { todo },
-    };
-  }
-);
-
-server.tool(
-  "list_todo",
-  "List todos",
-  {
-    completed: z.boolean().optional(),
-  },
-  async ({ completed }) => {
-    const filtered =
-      typeof completed === "boolean"
-        ? todos.filter((t) => t.completed === completed)
-        : todos;
-
-    return {
-      content: [
-        {
-          type: "text",
-          text:
-            filtered.length === 0
-              ? "No todos."
-              : filtered
-                  .map(
-                    (t) =>
-                      `- ${t.completed ? "[x]" : "[ ]"} ${t.text} (${t.id})`
-                  )
-                  .join("\n"),
-        },
-      ],
-      structuredContent: { todos: filtered },
-    };
-  }
-);
-
-server.tool(
-  "edit_todo",
-  "Edit a todo item",
-  {
-    id: z.string().min(1),
-    text: z.string().min(1).optional(),
-    completed: z.boolean().optional(),
-  },
-  async ({ id, text, completed }) => {
-    const todo = todos.find((t) => t.id === id);
-    if (!todo) {
       return {
-        content: [{ type: "text", text: `Todo not found: ${id}` }],
-        structuredContent: { error: "Todo not found", id },
+        content: [{ type: "text", text: `Added todo: ${todo.text}` }],
+        structuredContent: { todo },
       };
     }
+  );
 
-    if (typeof text === "string") {
-      todo.text = text;
-    }
-    if (typeof completed === "boolean") {
-      todo.completed = completed;
-    }
-    todo.updatedAt = nowIso();
+  server.tool(
+    "list_todo",
+    "List todos",
+    {
+      completed: z.boolean().optional(),
+    },
+    async ({ completed }) => {
+      const filtered =
+        typeof completed === "boolean"
+          ? todos.filter((t) => t.completed === completed)
+          : todos;
 
-    return {
-      content: [{ type: "text", text: `Updated todo: ${todo.text}` }],
-      structuredContent: { todo },
-    };
-  }
-);
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              filtered.length === 0
+                ? "No todos."
+                : filtered
+                    .map(
+                      (t) =>
+                        `- ${t.completed ? "[x]" : "[ ]"} ${t.text} (${t.id})`
+                    )
+                    .join("\n"),
+          },
+        ],
+        structuredContent: { todos: filtered },
+      };
+    }
+  );
+
+  server.tool(
+    "edit_todo",
+    "Edit a todo item",
+    {
+      id: z.string().min(1),
+      text: z.string().min(1).optional(),
+      completed: z.boolean().optional(),
+    },
+    async ({ id, text, completed }) => {
+      const todo = todos.find((t) => t.id === id);
+      if (!todo) {
+        return {
+          content: [{ type: "text", text: `Todo not found: ${id}` }],
+          structuredContent: { error: "Todo not found", id },
+        };
+      }
+
+      if (typeof text === "string") {
+        todo.text = text;
+      }
+      if (typeof completed === "boolean") {
+        todo.completed = completed;
+      }
+      todo.updatedAt = nowIso();
+
+      return {
+        content: [{ type: "text", text: `Updated todo: ${todo.text}` }],
+        structuredContent: { todo },
+      };
+    }
+  );
+
+  return server;
+};
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const transports: Record<string, StreamableHTTPServerTransport> = {};
+const sessions: Record<
+  string,
+  { transport: StreamableHTTPServerTransport; server: McpServer }
+> = {};
 
 app.all("/mcp", async (req, res) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    let transport = sessionId ? transports[sessionId] : undefined;
+    let session = sessionId ? sessions[sessionId] : undefined;
+    let transport = session?.transport;
 
     if (!transport) {
       if (req.method !== "POST" || !isInitializeRequest(req.body)) {
@@ -134,14 +142,23 @@ app.all("/mcp", async (req, res) => {
         return;
       }
 
-      transport = new StreamableHTTPServerTransport({
+      const server = createServer();
+
+      const newTransport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (newSessionId) => {
-          transports[newSessionId] = transport!;
+          sessions[newSessionId] = { transport: newTransport, server };
         },
       });
 
-      await server.connect(transport);
+      newTransport.onclose = () => {
+        if (newTransport.sessionId) {
+          delete sessions[newTransport.sessionId];
+        }
+      };
+
+      await server.connect(newTransport);
+      transport = newTransport;
     }
 
     await transport.handleRequest(req, res, req.body);
